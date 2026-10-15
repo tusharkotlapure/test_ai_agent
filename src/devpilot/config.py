@@ -1,8 +1,16 @@
 import os
-
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+DEVPILOT_PROJECT_ROOT = Path(
+    os.getenv(
+        "DEVPILOT_PROJECT_ROOT",
+        str(Path(__file__).resolve().parents[2]),
+    )
+).expanduser().resolve()
 
 def get_required_env(name: str) -> str:
     value = os.getenv(name)

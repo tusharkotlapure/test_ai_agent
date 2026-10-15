@@ -26,3 +26,4 @@ OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL",
     "liquid/lfm-2.5-2.6b:free",
 )
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")

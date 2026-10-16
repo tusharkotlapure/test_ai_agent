@@ -1,4 +1,5 @@
 import base64
+from pathlib import Path
 from urllib.parse import quote
 from typing import Any
 import re
@@ -211,8 +212,30 @@ def read_github_file(owner: str, repo: str, path: str) -> dict:
     if data.get("size", 0) > MAX_GITHUB_FILE_BYTES:
         raise ValueError("File exceeds the 100 KB size limit")
 
-    if data.get("encoding") != "base64" or not data.get("content"):
-        raise ValueError("GitHub did not return Base64 file content")
+    
+    if data.get("encoding") != "base64":
+        raise ValueError(
+            f"GitHub did not return Base64 content for '{path}'. "
+            f"Encoding: {data.get('encoding')!r}"
+        )
+
+    encoded_content = data.get("content")
+
+    if not isinstance(encoded_content, str):
+        raise ValueError(
+            f"GitHub returned invalid content for '{path}'"
+        )
+
+    try:
+        raw_content = base64.b64decode(
+            encoded_content,
+            validate=False,
+        )
+        content = raw_content.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"File '{path}' is not valid UTF-8 text"
+        ) from exc
 
     try:
         raw_content = base64.b64decode(
@@ -231,6 +254,254 @@ def read_github_file(owner: str, repo: str, path: str) -> dict:
         "path": data["path"],
         "size_bytes": len(raw_content),
         "content": content,
+    }
+
+
+SEARCHABLE_EXTENSIONS = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".json",
+    ".md",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".html",
+    ".css",
+    ".sql",
+    ".sh",
+}
+
+IGNORED_SEARCH_DIRS = {
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    "dist",
+    "build",
+}
+
+MAX_SEARCH_FILES = 40
+MAX_SEARCH_FILE_BYTES = 100_000
+MAX_SEARCH_TOTAL_BYTES = 1_000_000
+MAX_SEARCH_RESULTS = 50
+
+
+def search_github_code(
+    owner: str,
+    repo: str,
+    query: str,
+) -> dict:
+    """Search source files for a literal, case-insensitive keyword."""
+    validate_repository(owner, repo)
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Search query must not be empty")
+
+    query = query.strip()
+
+    if len(query) > 200:
+        raise ValueError("Search query must be 200 characters or fewer")
+
+    # Find the repository's default branch.
+    repo_info = get_github_repo_info(owner, repo)
+    branch = quote(repo_info["default_branch"], safe="")
+
+    # Fetch the repository tree in one API request.
+    tree_data = github_request(f"/repos/{owner}/{repo}/git/trees/{branch}?recursive=1")
+
+    tree = tree_data.get("tree", [])
+    truncated = tree_data.get("truncated", False)
+
+    # Keep only supported text files and skip generated directories.
+    candidates = []
+
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+
+        path = item.get("path", "")
+        parts = path.split("/")
+
+        if any(part in IGNORED_SEARCH_DIRS for part in parts):
+            continue
+
+        if Path(path).suffix.lower() not in SEARCHABLE_EXTENSIONS:
+            continue
+
+        size = item.get("size", 0)
+
+        if size > MAX_SEARCH_FILE_BYTES:
+            continue
+
+        candidates.append(item)
+
+    candidates.sort(key=lambda item: item["path"])
+    candidates = candidates[:MAX_SEARCH_FILES]
+
+    results = []
+    scanned_files = 0
+    scanned_bytes = 0
+
+    for item in candidates:
+        size = item.get("size", 0)
+
+        # Keep total downloaded source bounded.
+        if scanned_bytes + size > MAX_SEARCH_TOTAL_BYTES:
+            continue
+
+        blob = github_request(f"/repos/{owner}/{repo}/git/blobs/{item['sha']}")
+
+        if blob.get("encoding") != "base64":
+            continue
+
+        try:
+            raw = base64.b64decode(blob["content"])
+            content = raw.decode("utf-8")
+        except (ValueError, UnicodeDecodeError, KeyError):
+            # Skip malformed or binary content.
+            continue
+
+        scanned_files += 1
+        scanned_bytes += len(raw)
+
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            if query.casefold() not in line.casefold():
+                continue
+
+            results.append(
+                {
+                    "path": item["path"],
+                    "line": line_number,
+                    "text": line.strip()[:300],
+                }
+            )
+
+            if len(results) >= MAX_SEARCH_RESULTS:
+                break
+
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+
+    return {
+        "repository": f"{owner}/{repo}",
+        "query": query,
+        "matches": results,
+        "match_count": len(results),
+        "files_scanned": scanned_files,
+        "bytes_scanned": scanned_bytes,
+        "tree_truncated": truncated,
+        "file_limit_reached": len(candidates) >= MAX_SEARCH_FILES,
+    }
+
+
+MAX_RAG_FILES = 20
+MAX_RAG_TOTAL_BYTES = 500_000
+MAX_RAG_RESULTS = 5
+
+
+def search_repository_context(
+    owner: str,
+    repo: str,
+    query: str,
+) -> dict:
+    """Retrieve relevant source-code context using hybrid search."""
+    validate_repository(owner, repo)
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Search query must not be empty")
+
+    if len(query) > 200:
+        raise ValueError("Search query must be 200 characters or fewer")
+
+    # Discover supported source files in the repository.
+    repo_info = get_github_repo_info(owner, repo)
+    branch = quote(repo_info["default_branch"], safe="")
+
+    tree_data = github_request(f"/repos/{owner}/{repo}/git/trees/{branch}?recursive=1")
+
+    candidates = []
+
+    for item in tree_data.get("tree", []):
+        if item.get("type") != "blob":
+            continue
+
+        path = item.get("path", "")
+        parts = path.split("/")
+
+        if any(part in IGNORED_SEARCH_DIRS for part in parts):
+            continue
+
+        if Path(path).suffix.lower() not in SEARCHABLE_EXTENSIONS:
+            continue
+
+        size = item.get("size", 0)
+
+        if size > MAX_SEARCH_FILE_BYTES:
+            continue
+
+        candidates.append(item)
+
+    candidates.sort(key=lambda item: item["path"])
+
+    # Bound the amount of source code fetched and indexed.
+    selected_paths = []
+    total_bytes = 0
+
+    for item in candidates:
+        size = item.get("size", 0)
+
+        if len(selected_paths) >= MAX_RAG_FILES:
+            break
+
+        if total_bytes + size > MAX_RAG_TOTAL_BYTES:
+            continue
+
+        selected_paths.append(item["path"])
+        total_bytes += size
+
+    if not selected_paths:
+        return {
+            "repository": f"{owner}/{repo}",
+            "query": query,
+            "results": [],
+            "message": "No supported source files were found.",
+        }
+
+    # Import here to avoid a circular import:
+    # repository_index imports functions from this module.
+    from devpilot.context_builder import deduplicate_chunks
+    from devpilot.hybrid_search import hybrid_search
+    from devpilot.repository_index import build_repository_index
+
+    chunks = build_repository_index(
+        owner=owner,
+        repo=repo,
+        paths=selected_paths,
+    )
+
+    results = hybrid_search(
+        chunks,
+        query,
+        limit=MAX_RAG_RESULTS,
+    )
+
+    results = deduplicate_chunks(results)
+
+    return {
+        "repository": f"{owner}/{repo}",
+        "query": query,
+        "results": [
+            {
+                "path": chunk["path"],
+                "line_numbers": chunk["line_numbers"],
+                "text": chunk["text"],
+                "hybrid_score": chunk["hybrid_score"],
+            }
+            for chunk in results
+        ],
     }
 
 
@@ -335,6 +606,58 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_github_code",
+            "description": (
+                "Search a GitHub repository's supported source files for "
+                "a literal keyword. Returns matching file paths, line "
+                "numbers, and source lines."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "query": {
+                        "type": "string",
+                        "description": "Literal keyword or identifier to find.",
+                    },
+                },
+                "required": ["owner", "repo", "query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_repository_context",
+            "description": (
+                "Search a GitHub repository for source code relevant "
+                "to a question using keyword and semantic retrieval. "
+                "Use this for questions about implementation details "
+                "or how code works. Returns source snippets with "
+                "file paths and exact retained line numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "A question describing the code or behavior " "to find."
+                        ),
+                    },
+                },
+                "required": ["owner", "repo", "query"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -344,6 +667,8 @@ TOOL_FUNCTIONS = {
     "get_github_repo_info": get_github_repo_info,
     "list_github_files": list_github_files,
     "read_github_file": read_github_file,
+    "search_github_code": search_github_code,
+    "search_repository_context": search_repository_context,
 }
 
 TOOL_ALLOWED_ARGUMENTS = {
@@ -352,6 +677,8 @@ TOOL_ALLOWED_ARGUMENTS = {
     "get_github_repo_info": {"owner", "repo"},
     "list_github_files": {"owner", "repo", "path"},
     "read_github_file": {"owner", "repo", "path"},
+    "search_github_code": {"owner", "repo", "query"},
+    "search_repository_context": {"owner", "repo", "query"},
 }
 
 

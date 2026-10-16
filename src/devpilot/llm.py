@@ -1,4 +1,3 @@
-
 from openai import OpenAI
 
 from devpilot.config import (
@@ -6,6 +5,7 @@ from devpilot.config import (
     OPENROUTER_MODEL,
 )
 from devpilot.tools import TOOL_DEFINITIONS
+from devpilot.context_builder import deduplicate_chunks
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -35,7 +35,6 @@ def ask_llm(question: str) -> str:
         raise RuntimeError("The model returned an empty response")
 
     return answer
-
 
 
 def ask_llm_with_tools(question: str) -> dict:
@@ -89,3 +88,71 @@ def ask_llm_with_tools(question: str) -> dict:
         }
 
     raise RuntimeError("The model returned neither a tool call nor an answer")
+
+
+def ask_llm_with_context(question: str, context_chunks: list[dict]) -> str:
+    """Answer a question using retrieved source-code context."""
+    if not question.strip():
+        raise ValueError("Question must not be empty")
+
+    if not context_chunks:
+        return "I couldn't find relevant source code to answer " "this question."
+
+    context_chunks = deduplicate_chunks(context_chunks)
+
+    context_parts = []
+
+    context_parts = []
+
+    for chunk in context_chunks:
+        if "line_numbers" in chunk:
+            numbered_source = "\n".join(
+                f"{line_number}: {line}"
+                for line_number, line in zip(
+                    chunk["line_numbers"],
+                    chunk["text"].splitlines(),
+                )
+            )
+            line_reference = ", ".join(str(number) for number in chunk["line_numbers"])
+        else:
+            numbered_source = "\n".join(
+                f"{chunk['start_line'] + offset}: {line}"
+                for offset, line in enumerate(chunk["text"].splitlines())
+            )
+            line_reference = f"{chunk['start_line']}-{chunk['end_line']}"
+
+        context_parts.append(
+            f"File: {chunk['path']}\n"
+            f"Source lines: {line_reference}\n"
+            f"Source code:\n{numbered_source}"
+        )
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    response = client.chat.completions.create(
+        model=OPENROUTER_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Only cite file paths and line numbers explicitly present in "
+                    "the retrieved context. Do not invent line numbers or infer "
+                    "source code that was not provided."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Question:\n{question}\n\n"
+                    f"Retrieved source-code context:\n{context}"
+                ),
+            },
+        ],
+    )
+
+    answer = response.choices[0].message.content
+
+    if not answer:
+        raise RuntimeError("The model returned an empty response")
+
+    return answer

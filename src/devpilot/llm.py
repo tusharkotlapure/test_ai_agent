@@ -6,6 +6,7 @@ from devpilot.config import (
 )
 from devpilot.tools import TOOL_DEFINITIONS
 from devpilot.context_builder import deduplicate_chunks
+from devpilot.citation_validator import validate_citations
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -154,5 +155,35 @@ def ask_llm_with_context(question: str, context_chunks: list[dict]) -> str:
 
     if not answer:
         raise RuntimeError("The model returned an empty response")
+
+    validation = validate_citations(answer, context_chunks)
+
+    if not validation["has_citations"]:
+        return answer + (
+            "\n\nNote: This answer contains no citations in the "
+            "supported file-path:line-number format."
+        )
+
+    invalid_citations = [
+        citation
+        for citation in validation["citations"]
+        if not citation["valid"]
+    ]
+
+    if invalid_citations:
+        invalid_references = ", ".join(
+            f"{citation['path']}:{citation['start_line']}"
+            if citation["start_line"] == citation["end_line"]
+            else (
+                f"{citation['path']}:"
+                f"{citation['start_line']}-{citation['end_line']}"
+            )
+            for citation in invalid_citations
+        )
+
+        return answer + (
+            "\n\nWarning: The following citations could not be verified "
+            f"against the retrieved context: {invalid_references}"
+        )
 
     return answer

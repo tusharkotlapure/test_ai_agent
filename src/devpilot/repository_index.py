@@ -1,8 +1,27 @@
+
 from devpilot.code_index import index_source_file
 from devpilot.tools import (
     get_github_repo_info,
     read_github_file,
 )
+
+
+def index_repository_file(
+    owner: str,
+    repo: str,
+    path: str,
+) -> list[dict]:
+    """Read and index a single GitHub file."""
+    result = read_github_file(owner, repo, path)
+    content = result["content"]
+
+    if not content.strip():
+        return []
+
+    return index_source_file(
+        path=result["path"],
+        content=content,
+    )
 
 
 def build_repository_index(
@@ -16,16 +35,8 @@ def build_repository_index(
     indexed_chunks = []
 
     for path in paths:
-        result = read_github_file(owner, repo, path)
-        
-        if not result["content"].strip():
-            continue
-        
         indexed_chunks.extend(
-            index_source_file(
-                path=result["path"],
-                content=result["content"],
-            )
+            index_repository_file(owner, repo, path)
         )
 
     return indexed_chunks

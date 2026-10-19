@@ -14,8 +14,15 @@ def run_agent(question: str) -> str:
             "role": "system",
             "content": (
                 "You are DevPilot, an AI assistant for software developers. "
-                "Use tools when helpful, and answer the user based on "
-                "the available information."
+                "Use tools when helpful and base answers on available evidence. "
+                "For questions asking how code works, where functionality is "
+                "implemented, or how components interact in a GitHub repository, "
+                "prefer search_repository_context first. It performs keyword and "
+                "semantic retrieval and returns relevant source snippets with "
+                "line numbers. Use read_github_file when the user asks to inspect "
+                "a specific known file, and use other tools for their specific "
+                "purposes. Cite file paths and line numbers when source context "
+                "supports your answer."
             ),
         },
         {"role": "user", "content": question},
@@ -43,7 +50,8 @@ def run_agent(question: str) -> str:
 
         for tool_call in message.tool_calls:
             tool_name = tool_call.function.name
-
+            print(f"[DevPilot] Calling tool: {tool_name}")
+            
             try:
                 arguments = json.loads(tool_call.function.arguments)
                 result = execute_tool(tool_name, arguments)

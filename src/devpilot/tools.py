@@ -102,8 +102,7 @@ def github_request(path: str) -> dict | list:
 
     if response.status_code == 403:
         raise RuntimeError(
-            "GitHub denied the request. Check API rate limits "
-            "or repository permissions."
+            f"GitHub denied the request. " f"Response: {response.text[:1000]}"
         )
 
     response.raise_for_status()
@@ -212,7 +211,6 @@ def read_github_file(owner: str, repo: str, path: str) -> dict:
     if data.get("size", 0) > MAX_GITHUB_FILE_BYTES:
         raise ValueError("File exceeds the 100 KB size limit")
 
-    
     if data.get("encoding") != "base64":
         raise ValueError(
             f"GitHub did not return Base64 content for '{path}'. "
@@ -222,9 +220,7 @@ def read_github_file(owner: str, repo: str, path: str) -> dict:
     encoded_content = data.get("content")
 
     if not isinstance(encoded_content, str):
-        raise ValueError(
-            f"GitHub returned invalid content for '{path}'"
-        )
+        raise ValueError(f"GitHub returned invalid content for '{path}'")
 
     try:
         raw_content = base64.b64decode(
@@ -233,9 +229,7 @@ def read_github_file(owner: str, repo: str, path: str) -> dict:
         )
         content = raw_content.decode("utf-8")
     except (ValueError, UnicodeDecodeError) as exc:
-        raise ValueError(
-            f"File '{path}' is not valid UTF-8 text"
-        ) from exc
+        raise ValueError(f"File '{path}' is not valid UTF-8 text") from exc
 
     try:
         raw_content = base64.b64decode(
@@ -461,7 +455,13 @@ def search_repository_context(
 
         selected_paths.append(item["path"])
         total_bytes += size
-
+        
+    selected_shas = {
+        item["path"]: item["sha"]
+        for item in candidates
+        if item["path"] in selected_paths
+    }
+    
     if not selected_paths:
         return {
             "repository": f"{owner}/{repo}",
@@ -474,12 +474,13 @@ def search_repository_context(
     # repository_index imports functions from this module.
     from devpilot.context_builder import deduplicate_chunks
     from devpilot.hybrid_search import hybrid_search
-    from devpilot.repository_index import build_repository_index
+    from devpilot.index_cache import get_repository_index
 
-    chunks = build_repository_index(
+    chunks = get_repository_index(
         owner=owner,
         repo=repo,
         paths=selected_paths,
+        file_shas=selected_shas,
     )
 
     results = hybrid_search(
